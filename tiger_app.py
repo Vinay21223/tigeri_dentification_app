@@ -1,4 +1,4 @@
-# tiger_app.py
+# tiger_app_improved.py
 import streamlit as st
 import os
 import math
@@ -10,14 +10,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import cv2
 import tempfile
-
-# PyTorch imports
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 import timm
+import requests
+import zipfile
+from pathlib import Path
 
 # Set page config
 st.set_page_config(
@@ -58,6 +59,9 @@ st.markdown("""
         border: 1px solid #E6E9EF;
         margin: 0.5rem 0;
     }
+    .stProgress > div > div > div > div {
+        background-color: #FF4B4B;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -68,15 +72,15 @@ st.write("Upload two tiger images or use your camera to compare them and see if 
 # Initialize session state
 if 'model' not in st.session_state:
     st.session_state.model = None
-if 'metadata' not in st.session_state:
-    st.session_state.metadata = None
 if 'transform' not in st.session_state:
     st.session_state.transform = None
 if 'trained' not in st.session_state:
     st.session_state.trained = False
+if 'device' not in st.session_state:
+    st.session_state.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # =====================
-# 1. ArcFace Loss + Model
+# 1. ArcFace Loss + Model (Improved)
 # =====================
 class ArcFaceLoss(nn.Module):
     def __init__(self, in_features, out_features, scale=64.0, margin=0.5):
@@ -87,11 +91,15 @@ class ArcFaceLoss(nn.Module):
         self.margin = margin
         self.cos_m = math.cos(margin)
         self.sin_m = math.sin(margin)
+        self.th = math.cos(math.pi - margin)
+        self.mm = math.sin(math.pi - margin) * margin
 
     def forward(self, input, labels):
         cosine = F.linear(F.normalize(input), F.normalize(self.weight))
         sine = torch.sqrt(1.0 - torch.clamp(cosine**2, 0, 1))
         phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        
         one_hot = torch.zeros_like(cosine)
         one_hot.scatter_(1, labels.view(-1, 1).long(), 1.0)
         logits = one_hot * phi + (1.0 - one_hot) * cosine
@@ -100,20 +108,24 @@ class ArcFaceLoss(nn.Module):
 class ArcFaceNet(nn.Module):
     def __init__(self, embedding_dim=512, num_classes=100):
         super().__init__()
-        # Use a more commonly available model
-        self.backbone = timm.create_model("resnet50", pretrained=True, num_classes=0)
+        # Use EfficientNet which often works better for fine-grained recognition
+        self.backbone = timm.create_model("efficientnet_b0", pretrained=True, num_classes=0)
         self.embedding = nn.Linear(self.backbone.num_features, embedding_dim)
+        self.bn = nn.BatchNorm1d(embedding_dim)
+        self.dropout = nn.Dropout(0.3)
         self.arcface = ArcFaceLoss(embedding_dim, num_classes)
 
     def forward(self, x, labels=None):
         x = self.backbone(x)
         x = self.embedding(x)
+        x = self.bn(x)
+        x = self.dropout(x)
         if labels is not None:
             return self.arcface(x, labels), x
         return x
 
 # =====================
-# 2. Dataset Handling
+# 2. Dataset Handling (Improved)
 # =====================
 class WildlifeDataset(Dataset):
     def __init__(self, df, root, transform=None):
@@ -121,6 +133,7 @@ class WildlifeDataset(Dataset):
         self.labels = df['identity'].astype('category').cat.codes.values
         self.root = root
         self.transform = transform
+        self.label_to_class = {label: idx for idx, label in enumerate(df['identity'].astype('category').cat.categories)}
 
     def __len__(self):
         return len(self.paths)
@@ -132,42 +145,86 @@ class WildlifeDataset(Dataset):
         return img, self.labels[idx]
 
 # =====================
-# 3. Training Function
+# 3. Training Function (Improved)
 # =====================
-def train_model(model, dataloader, num_epochs=2, device='cpu'):
+def train_model(model, train_loader, val_loader, num_epochs=10, device='cpu'):
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.CrossEntropyLoss()
 
-    model.train()
+    best_val_loss = float('inf')
+    patience = 3
+    patience_counter = 0
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
+    loss_chart = st.line_chart()
+    train_losses = []
+    val_losses = []
     
     for epoch in range(num_epochs):
-        total_loss = 0
-        for batch_idx, (images, labels) in enumerate(dataloader):
+        # Training
+        model.train()
+        train_loss = 0
+        for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device).long()
             
-            # Forward pass
+            optimizer.zero_grad()
             logits, _ = model(images, labels)
             loss = criterion(logits, labels)
-            
-            # Backward pass
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
             
-            total_loss += loss.item()
+            train_loss += loss.item()
             
             # Update progress
-            progress = (epoch * len(dataloader) + batch_idx) / (num_epochs * len(dataloader))
+            progress = (epoch * len(train_loader) + batch_idx) / (num_epochs * len(train_loader))
             progress_bar.progress(progress)
-            status_text.text(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{len(dataloader)}, Loss: {loss.item():.4f}")
+            status_text.text(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
         
-        st.write(f"Epoch {epoch+1} Loss: {total_loss / len(dataloader):.4f}")
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device).long()
+                logits, _ = model(images, labels)
+                val_loss += criterion(logits, labels).item()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        
+        # Update loss chart
+        loss_data = pd.DataFrame({
+            'Train Loss': train_losses,
+            'Validation Loss': val_losses
+        })
+        loss_chart.line_chart(loss_data)
+        
+        st.write(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # Early stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                st.write("Early stopping triggered")
+                break
+        
+        scheduler.step()
     
     progress_bar.empty()
     status_text.empty()
+    
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pth', map_location=device))
     return model
 
 # =====================
@@ -199,7 +256,29 @@ def compare_two_images(image1, image2, model, transform, threshold=0.5, device='
     return similarity, prediction, confidence
 
 # =====================
-# 5. Camera Function
+# 5. Data Augmentation
+# =====================
+def get_transforms():
+    train_transform = T.Compose([
+        T.Resize((256, 256)),
+        T.RandomCrop((224, 224)),
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(10),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    return train_transform, val_transform
+
+# =====================
+# 6. Camera Function
 # =====================
 def capture_from_webcam():
     """Capture image using OpenCV"""
@@ -225,13 +304,47 @@ def capture_from_webcam():
         return None
 
 # =====================
-# 6. Main App Logic
+# 7. Create Sample Dataset (Improved)
+# =====================
+def create_sample_dataset():
+    """Create a more realistic sample dataset"""
+    os.makedirs('sample_data', exist_ok=True)
+    os.makedirs('sample_data/tiger1', exist_ok=True)
+    os.makedirs('sample_data/tiger2', exist_ok=True)
+    os.makedirs('sample_data/tiger3', exist_ok=True)
+    
+    # Create sample CSV
+    data = []
+    for tiger_id in [1, 2, 3]:
+        for img_num in range(10):  # 10 images per tiger
+            # Create a dummy image with some variation
+            img = np.random.randint(50, 200, (224, 224, 3), dtype=np.uint8)
+            if tiger_id == 1:
+                img[50:100, 50:100] = [255, 0, 0]  # Red square for tiger1
+            elif tiger_id == 2:
+                img[50:100, 50:100] = [0, 255, 0]  # Green square for tiger2
+            else:
+                img[50:100, 50:100] = [0, 0, 255]  # Blue square for tiger3
+                
+            img_path = f'sample_data/tiger{tiger_id}/image_{img_num}.jpg'
+            Image.fromarray(img).save(img_path)
+            data.append({'path': img_path, 'identity': f'tiger{tiger_id}'})
+    
+    df = pd.DataFrame(data)
+    return df, 'sample_data'
+
+# =====================
+# 8. Main App Logic (Improved)
 # =====================
 def main():
     # Sidebar
     with st.sidebar:
         st.header("Settings")
         threshold = st.slider("Similarity Threshold", 0.0, 1.0, 0.5, 0.01)
+        
+        st.header("Training Options")
+        num_epochs = st.slider("Number of Epochs", 1, 50, 10)
+        batch_size = st.slider("Batch Size", 4, 32, 8)
         
         st.header("Actions")
         train_model_btn = st.button("Train Model", type="primary")
@@ -244,51 +357,35 @@ def main():
         """)
     
     # Initialize device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = st.session_state.device
     st.write(f"Using device: {device}")
     
-    # Define transformations
-    transform = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize([0.5]*3, [0.5]*3)
-    ])
+    # Get transforms
+    train_transform, val_transform = get_transforms()
+    st.session_state.transform = val_transform
     
     # Train model if requested
-    if train_model_btn and not st.session_state.trained:
-        with st.spinner("Training model... This may take a while."):
-            # For demo purposes, we'll create a simple model
-            # In a real app, you would load your actual trained model
-            model = ArcFaceNet(embedding_dim=256, num_classes=50)
+    if train_model_btn:
+        with st.spinner("Creating sample dataset..."):
+            df, root_dir = create_sample_dataset()
             
-            # Freeze backbone, train only final layers
-            for param in model.backbone.parameters():
-                param.requires_grad = False
-            for param in model.embedding.parameters():
-                param.requires_grad = True
-            for param in model.arcface.parameters():
-                param.requires_grad = True
-                
-            # Create dummy data for demonstration
-            # In a real app, you would use your actual dataset
-            class DummyDataset(Dataset):
-                def __init__(self, transform=None):
-                    self.transform = transform
-                    
-                def __len__(self):
-                    return 100
-                    
-                def __getitem__(self, idx):
-                    # Create a random image
-                    img = torch.rand(3, 224, 224)
-                    label = torch.randint(0, 50, (1,)).item()
-                    return img, label
-                    
-            dummy_dataset = DummyDataset(transform)
-            dummy_loader = DataLoader(dummy_dataset, batch_size=8, shuffle=True)
+        with st.spinner("Preparing data loaders..."):
+            # Split data
+            train_df, val_df = train_test_split(df, test_size=0.2, stratify=df['identity'], random_state=42)
             
-            # Train for just 1 epoch for demonstration
-            model = train_model(model, dummy_loader, num_epochs=1, device=device)
+            train_dataset = WildlifeDataset(train_df, root_dir, train_transform)
+            val_dataset = WildlifeDataset(val_df, root_dir, val_transform)
+            
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            
+            num_classes = len(df['identity'].unique())
+            
+        with st.spinner("Training model..."):
+            model = ArcFaceNet(embedding_dim=512, num_classes=num_classes)
+            
+            # Train for specified epochs
+            model = train_model(model, train_loader, val_loader, num_epochs=num_epochs, device=device)
             
             st.session_state.model = model
             st.session_state.trained = True
@@ -298,6 +395,9 @@ def main():
     st.markdown('<h2 class="sub-header">Upload or Capture Images</h2>', unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
+    
+    img1 = None
+    img2 = None
     
     with col1:
         st.write("**First Image**")
@@ -313,8 +413,6 @@ def main():
                 img1 = capture_from_webcam()
                 if img1:
                     st.image(img1, caption="Captured Image 1", use_column_width=True)
-                else:
-                    img1 = None
     
     with col2:
         st.write("**Second Image**")
@@ -330,18 +428,17 @@ def main():
                 img2 = capture_from_webcam()
                 if img2:
                     st.image(img2, caption="Captured Image 2", use_column_width=True)
-                else:
-                    img2 = None
     
     # Compare images
     if compare_images_btn:
-        if 'img1' in locals() and img1 is not None and 'img2' in locals() and img2 is not None:
+        if img1 is not None and img2 is not None:
             if not st.session_state.trained:
                 st.warning("Please train the model first!")
             else:
                 with st.spinner("Comparing images..."):
                     similarity, prediction, confidence = compare_two_images(
-                        img1, img2, st.session_state.model, transform, threshold, device
+                        img1, img2, st.session_state.model, 
+                        st.session_state.transform, threshold, device
                     )
                 
                 # Display results
